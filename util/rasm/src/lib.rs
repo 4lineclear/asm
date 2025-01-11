@@ -1,27 +1,54 @@
-use std::fs::{self, create_dir_all, remove_dir_all};
-use std::io::ErrorKind::NotFound;
-use std::path::{Path, PathBuf};
-use std::process;
-use std::process::Command;
+use std::{
+    fs::{self, create_dir_all, remove_dir_all},
+    io::{self, ErrorKind::NotFound, IsTerminal, Write},
+    path::{Path, PathBuf},
+    process,
+};
 
-use anyhow::ensure;
 use clap::Parser;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use termcolor::{Color, ColorSpec, StandardStream, WriteColor};
 use walkdir::WalkDir;
 
-// TODO: create better clean system
-macro_rules! println {
-    ($($token:tt)*) => {
-        if !std::env::var("QUIET").is_ok() {
-            std::println!($($token)*)
-        }
+// TODO: custom build dir
+
+// TODO: consider stderr where errors occur
+
+// TODO: metadata system in build dir
+
+// TODO: add unit testing
+
+// TODO: add integration testing
+
+macro_rules! proc_cmd {
+    ($name:expr $(, $arg:expr)* $(,)?) => {
+        std::process::Command::new($name) $(.arg($arg))*
     };
 }
 
 const ABOUT: &str = "\
 Compiles, Links, and Runs asm.
 if <files> are ommited, reads all files in base.";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<ColorMode> for termcolor::ColorChoice {
+    fn from(value: ColorMode) -> Self {
+        use termcolor::ColorChoice::*;
+        match value {
+            ColorMode::Auto => Auto,
+            ColorMode::Always => Always,
+            ColorMode::Never => Never,
+        }
+    }
+}
 
 #[derive(Default, Deserialize, Parser)]
 #[command(name = "rasm")]
@@ -39,8 +66,12 @@ struct Config {
     quiet: bool,
     /// Clean build dir after compiling & running
     #[serde(default)]
-    #[arg(short, long)]
+    #[arg(long)]
     clean: bool,
+    /// Color Mode, auto, never, always
+    #[serde(default)]
+    #[arg(short, long)]
+    color: Option<ColorMode>,
     /// Base path to look for files in
     ///
     /// Defaults to src
@@ -50,10 +81,6 @@ struct Config {
     /// Files to compile, relative to base
     #[serde(default)]
     files: Option<Vec<PathBuf>>,
-}
-
-fn base_path() -> PathBuf {
-    PathBuf::from("src")
 }
 
 fn read_files(files: Option<Vec<PathBuf>>, base: &Path) -> Vec<PathBuf> {
@@ -79,11 +106,16 @@ fn read_files(files: Option<Vec<PathBuf>>, base: &Path) -> Vec<PathBuf> {
             .filter_map(|p| filter(p.path()).then(|| p.into_path()))
             .collect()
     };
-    files.map(read_files).unwrap_or_else(read_all)
+    if !base.exists() {
+        return Vec::new();
+    }
+    let mut files: Vec<_> = files.map(read_files).unwrap_or_else(read_all);
+    files.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    files
 }
 
 fn check_tooling() -> anyhow::Result<process::Output> {
-    match Command::new("nasm").arg("--version").output() {
+    match proc_cmd!("nasm", "--version").output() {
         Ok(c) => Ok(c),
         Err(e) if e.kind() == NotFound => Err(anyhow::anyhow!("nasm not found")),
         Err(e) => Err(e.into()),
@@ -102,79 +134,189 @@ fn read_config() -> Config {
 }
 
 fn init() -> Config {
+    fn merge<T>(a: Option<T>, b: Option<T>) -> Option<T> {
+        if let Some(a) = a {
+            return Some(a);
+        }
+        b
+    }
     let args = Config::parse();
-    let mut config = read_config();
-    if let Some(run) = args.run {
-        config.run = Some(run);
+    let config = read_config();
+    Config {
+        run: merge(args.run, config.run),
+        quiet: if args.quiet { true } else { config.quiet },
+        clean: if args.clean { true } else { config.clean },
+        color: merge(args.color, config.color),
+        base: merge(args.base, config.base),
+        files: merge(args.files, config.files),
     }
-    if args.quiet {
-        config.quiet = true;
-    }
-    if args.clean {
-        config.clean = true;
-    }
-    if let Some(base) = args.base {
-        config.base = Some(base);
-    }
-    if let Some(files) = args.files {
-        config.files = Some(files);
-    }
-    config
 }
 
 pub fn run() -> anyhow::Result<()> {
     let args = init();
+    let mut writer = ColorWriter::new(args.color.unwrap_or(ColorMode::Auto), args.quiet);
+
     if args.quiet {
         std::env::set_var("QUIET", "true");
+    } else {
+        std::env::remove_var("QUIET");
     }
-    let base = args.base.unwrap_or_else(base_path);
-    ensure!(base.exists(), "src directory not found\n");
 
     check_tooling()?;
 
-    let files = read_files(args.files, &base);
-    let build_base = PathBuf::from("build");
+    let src_base = args.base.unwrap_or(PathBuf::from("src"));
+    let obj_base = PathBuf::from("build/obj");
+    let bin_base = PathBuf::from("build/bin");
 
-    println!("Compiling & Linking Files:");
+    let files = read_files(args.files, &src_base);
 
-    create_dir_all("build")?;
+    if files.is_empty() {
+        writer.fg(Some(Color::Red))?;
+        writeln!(
+            writer,
+            "No assembly found in path: {}",
+            src_base.to_string_lossy()
+        )?;
+        writer.reset()?;
+        return Ok(());
+    }
 
-    files.par_iter().try_for_each(|file_source| {
-        let with_extension = |ext: &str| {
-            let mut file = build_base.join(file_source.strip_prefix("src")?);
-            file.set_extension(ext);
-            anyhow::Ok(file)
-        };
-        let object_file = with_extension("o")?;
-        let output_file = with_extension("")?;
+    let paths: Vec<_> = files
+        .iter()
+        .flat_map(|src| {
+            let asrc = src.strip_prefix(&src_base).ok()?;
+            let obj = obj_base.join(asrc).with_extension("o");
+            let bin = bin_base.join(asrc).with_extension("");
+            Some((src, asrc, obj, bin))
+        })
+        .collect();
 
-        let src = file_source.to_string_lossy();
-        let obj = object_file.to_string_lossy();
-        let out = output_file.to_string_lossy();
+    create_dir_all(&src_base)?;
+    create_dir_all(&obj_base)?;
+    create_dir_all(&bin_base)?;
 
-        println!("- {} to {} to {}", &src, &obj, &out);
-        Command::new("nasm")
-            .args(["-f", "elf64", &src, "-o", &obj])
+    writer.fg(Some(Color::Blue))?;
+    writeln!(
+        writer,
+        "{} files found, {} paths valid\nCompiling",
+        files.len(),
+        paths.len()
+    )?;
+    writer.reset()?;
+
+    paths.iter().try_for_each(|(src, asrc, obj, _)| {
+        writeln!(writer, "- {}", asrc.to_string_lossy())?;
+        proc_cmd!("nasm", "-f", "elf64", &src, "-o", &obj)
             .spawn()?
             .wait_with_output()?;
-        Command::new("ld")
-            .args([&obj, "-o", &out])
-            .spawn()?
-            .wait_with_output()?;
-        anyhow::Ok(())
+        io::Result::Ok(())
     })?;
 
-    if let Some(file) = args.run {
-        let file = build_base.join(&file);
-        println!("running {}:\n", file.to_string_lossy());
-        Command::new(file).spawn()?.wait_with_output()?;
+    writer.fg(Some(Color::Blue))?;
+    writeln!(writer, "\nLinking")?;
+    writer.reset()?;
+
+    paths.iter().try_for_each(|(_, asrc, obj, bin)| {
+        writeln!(writer, "- {}", asrc.to_string_lossy())?;
+        proc_cmd!("ld", &obj, "-o", &bin)
+            .spawn()?
+            .wait_with_output()?;
+        io::Result::Ok(())
+    })?;
+
+    writer.fg(Some(Color::Green))?;
+    writeln!(writer, "\nDone")?;
+    writer.reset()?;
+
+    if let Some(ref file) = args.run {
+        let file = bin_base.join(file);
+        if file.exists() {
+            writer.fg(Some(Color::Blue))?;
+            writeln!(writer, "running {}:\n", file.to_string_lossy())?;
+            writer.reset()?;
+            proc_cmd!(file).spawn()?.wait_with_output()?;
+        } else {
+            writer.fg(Some(Color::Red))?;
+            writeln!(writer, "\nfile not found: {}:\n", file.to_string_lossy())?;
+            writer.reset()?;
+        }
     }
 
     if args.clean {
-        println!("\ncleaning files...");
-        remove_dir_all(build_base)?;
+        writer.fg(Some(Color::Blue))?;
+        writeln!(writer, "\ncleaning files...")?;
+        writer.reset()?;
+        remove_dir_all(obj_base)?;
+        remove_dir_all(bin_base)?;
     }
+    if args.clean || args.run.is_some() {
+        writer.fg(Some(Color::Green))?;
+        writeln!(writer, "\nDone")?;
+        writer.reset()?;
+    }
+
     Ok(())
+}
+
+struct ColorWriter {
+    q: bool,
+    w: StandardStream,
+}
+
+#[allow(unused)]
+impl ColorWriter {
+    fn new(mut color: ColorMode, quiet: bool) -> Self {
+        if color == ColorMode::Auto && !std::io::stdin().is_terminal() {
+            color = ColorMode::Never;
+        }
+        let w = StandardStream::stdout(color.into());
+        let q = quiet;
+        Self { q, w }
+    }
+    fn reset(&mut self) -> io::Result<()> {
+        self.w.set_color(ColorSpec::new().set_reset(true))?;
+        self.w.flush()
+    }
+    fn fg(&mut self, color: Option<Color>) -> io::Result<()> {
+        self.w.set_color(ColorSpec::new().set_fg(color))
+    }
+    fn bg(&mut self, color: Option<Color>) -> io::Result<()> {
+        self.w.set_color(ColorSpec::new().set_bg(color))
+    }
+}
+
+impl io::Write for ColorWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.q {
+            return Ok(0);
+        };
+        self.w.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if self.q {
+            return Ok(0);
+        };
+        self.w.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if self.q {
+            return Ok(());
+        };
+        self.w.write_all(buf)
+    }
+
+    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> io::Result<()> {
+        if self.q {
+            return Ok(());
+        };
+        self.w.write_fmt(fmt)
+    }
 }
 
 fn get_styles() -> clap::builder::Styles {

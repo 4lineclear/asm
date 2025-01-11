@@ -1,2 +1,4 @@
-run = "hello"
+# base = "2-print-any"
+run = "3-print-any"
 quiet = true
+# clean = true
