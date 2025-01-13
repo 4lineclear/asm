@@ -1,4 +1,4 @@
 # base = "2-print-any"
-run = "3-print-any"
-quiet = true
+run = "6-read-file"
+# quiet = true
 # clean = true
